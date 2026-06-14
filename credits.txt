@@ -1,0 +1,2 @@
+Basado en ideas de grumpy_bot, mapa de LW7DFM,
+firmware de Meshtastic y cartel de led "marquee".
