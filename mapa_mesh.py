@@ -1440,7 +1440,7 @@ def main():
     t_hb.start()
 
     log.info(f"Servidor en http://{BIND_HOST}:{BIND_PORT}")
-    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False)
+    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context='adhoc')
 
 
 if __name__ == "__main__":
