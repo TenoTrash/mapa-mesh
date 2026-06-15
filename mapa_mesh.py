@@ -13,6 +13,7 @@ import json
 import math
 import threading
 import logging
+import logging.handlers
 from dataclasses import dataclass, asdict, field
 from typing import Dict, Optional, List, Tuple
 
@@ -22,8 +23,24 @@ from pubsub import pub
 
 import meshtastic.serial_interface
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+import os as _os_log
+_LOG_FILE = _os_log.path.join(_os_log.path.dirname(_os_log.path.abspath(__file__)), "mapa_mesh.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),                              # consola
+        logging.handlers.RotatingFileHandler(                # archivo rotativo
+            _LOG_FILE,
+            maxBytes=5 * 1024 * 1024,   # 5 MB por archivo
+            backupCount=3,               # hasta 3 archivos de backup
+            encoding="utf-8",
+        ),
+    ]
+)
 log = logging.getLogger("mapa-mesh")
+log.info(f"Log guardado en: {_LOG_FILE}")
 
 # =============================================================================
 #                               CONFIGURACION
@@ -117,7 +134,7 @@ nodes: Dict[str, NodeEntry] = {}
 # Mensajes de texto recibidos (todos los canales)
 messages_lock = threading.Lock()
 messages: List[MessageEntry] = []
-MAX_MESSAGES = 50   # cuántos mensajes conservar en memoria
+MAX_MESSAGES = 300  # cuántos mensajes conservar en memoria
 
 state_lock    = threading.Lock()
 last_packet_ts = 0.0
@@ -683,6 +700,13 @@ def meshtastic_thread():
 app      = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+# Contador de usuarios activos: cada cliente hace polling cada POLL_REFRESH_SEC.
+# Registramos la última vez que cada IP hizo un GET /api/nodes.
+# Si no pidió en los últimos 15s, se considera desconectado.
+active_connections_lock = threading.Lock()
+active_connections: dict = {}   # ip → last_seen timestamp
+VIEWER_TIMEOUT_SEC = 15
+
 # Permite reutilizar el puerto inmediatamente después de un reinicio
 import socket as _socket
 app.config["PROPAGATE_EXCEPTIONS"] = True
@@ -692,13 +716,37 @@ _reuse = getattr(_socket, "SO_REUSEPORT", None) or _socket.SO_REUSEADDR
 def get_status() -> dict:
     with state_lock:
         age = (now() - last_packet_ts) if last_packet_ts else None
-        return {
-            "connected":          connected,
-            "last_packet_age_sec": age,
-            "last_error":         last_error or None,
-            "refresh_sec":        POLL_REFRESH_SEC,
-            "prune_after_sec":    PRUNE_AFTER_SEC,
-        }
+
+    # RSSI y SNR promedio de nodos con datos
+    rssi_vals, snr_vals = [], []
+    with nodes_lock:
+        for e in nodes.values():
+            if e.rssi is not None: rssi_vals.append(e.rssi)
+            if e.snr  is not None: snr_vals.append(e.snr)
+
+    avg_rssi = round(sum(rssi_vals) / len(rssi_vals), 1) if rssi_vals else None
+    avg_snr  = round(sum(snr_vals)  / len(snr_vals),  1) if snr_vals  else None
+
+    # Mensajes en las últimas 24hs
+    cutoff_24h = now() - 86400
+    with messages_lock:
+        msgs_24h = sum(1 for m in messages if m.timestamp >= cutoff_24h)
+
+    # Usuarios activos (conexiones SocketIO abiertas)
+    with active_connections_lock:
+        viewers = len(active_connections)
+
+    return {
+        "connected":           connected,
+        "last_packet_age_sec": age,
+        "last_error":          last_error or None,
+        "refresh_sec":         POLL_REFRESH_SEC,
+        "prune_after_sec":     PRUNE_AFTER_SEC,
+        "avg_rssi":            avg_rssi,
+        "avg_snr":             avg_snr,
+        "msgs_24h":            msgs_24h,
+        "viewers":             viewers,
+    }
 
 
 @app.get("/export/routes.csv")
@@ -756,6 +804,18 @@ def serve_logo():
 
 @app.get("/api/nodes")
 def api_nodes():
+    from flask import request as flask_req
+    client_ip = flask_req.remote_addr or "unknown"
+    # Excluir el watchdog (127.0.0.1) del conteo de viewers
+    if client_ip != "127.0.0.1":
+        with active_connections_lock:
+            active_connections[client_ip] = now()
+        # Limpiar IPs que no pidieron en los últimos VIEWER_TIMEOUT_SEC
+        cutoff = now() - VIEWER_TIMEOUT_SEC
+        with active_connections_lock:
+            stale = [ip for ip, ts in active_connections.items() if ts < cutoff]
+            for ip in stale:
+                del active_connections[ip]
     return jsonify({"status": get_status(), "nodes": serialize_nodes(), "messages": serialize_messages()})
 
 
@@ -1000,6 +1060,21 @@ def index():
       <div class="stat-box">
         <div class="stat-num" id="st-routes">0</div>
         <div class="stat-lbl">rutas</div>
+      </div>
+    </div>
+    <div class="stats-bar">
+      <div class="stat-box">
+        <div class="stat-num" id="st-rssi" style="font-size:11px;font-weight:700;line-height:1.4">—</div>
+        <div class="stat-num" id="st-snr"  style="font-size:11px;font-weight:700;line-height:1.4">—</div>
+        <div class="stat-lbl">RSSI / SNR</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-num" id="st-viewers">0</div>
+        <div class="stat-lbl">viendo</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-num" id="st-msgs24h">0</div>
+        <div class="stat-lbl">msgs 24h</div>
       </div>
     </div>
 
@@ -1336,6 +1411,18 @@ function updateStatus(st) {{
     el.className = "pill bad";
     el.textContent = "Desconectado" + (st.last_error ? ": " + st.last_error : "");
   }}
+
+  // Segunda fila de stats
+  const rssiEl = document.getElementById("st-rssi");
+  const snrEl  = document.getElementById("st-snr");
+  if (rssiEl) rssiEl.textContent = st.avg_rssi != null ? st.avg_rssi + " dBm" : "—";
+  if (snrEl)  snrEl.textContent  = st.avg_snr  != null ? st.avg_snr  + " dB"  : "—";
+
+  const viewEl = document.getElementById("st-viewers");
+  if (viewEl) viewEl.textContent = st.viewers != null ? st.viewers : "—";
+
+  const msgsEl = document.getElementById("st-msgs24h");
+  if (msgsEl) msgsEl.textContent = st.msgs_24h != null ? st.msgs_24h : "—";
 }}
 
 function fmtTime(ts) {{
