@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # =============================================================================
-# mapa-mesh — v1.0
+# mapa-mesh — v1.1
 # Muestra nodos Meshtastic con GPS en un mapa local.
 # Realiza traceroute activo cuando llega un paquete de posicion,
 # dibuja ruta de ida (azul) y vuelta (naranja) sobre Leaflet/OSM.
@@ -50,9 +50,10 @@ SERIAL_PORT   = "/dev/ttyACM0"
 BIND_HOST     = "0.0.0.0"
 BIND_PORT     = 8080
 
-# Coordenadas de TU nodo (sin GPS — editá esto cada vez que cambies de lugar)
-HOME_LAT      = -34.606615
-HOME_LON      = -58.4355
+# Coordenadas de TU nodo (sin GPS — EDITÁ ESTO antes de usar)
+# Ejemplo: Centro de Buenos Aires. Reemplazá con tu ubicación real.
+HOME_LAT      = -34.603722
+HOME_LON      = -58.381592
 
 # Centro inicial del mapa y zoom
 MAP_CENTER_LAT  = HOME_LAT
@@ -1722,7 +1723,18 @@ def main():
     t_wd.start()
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
-    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context='adhoc')
+    import os as _ssl_os
+    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "cert.pem")
+    _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "cert.key")
+
+    if _ssl_os.path.exists(_SSL_CERT) and _ssl_os.path.exists(_SSL_KEY):
+        log.info(f"Usando certificado SSL: {_SSL_CERT}")
+        _ssl_ctx = (_SSL_CERT, _SSL_KEY)
+    else:
+        log.warning("Certificados SSL no encontrados, usando adhoc (autofirmado)")
+        _ssl_ctx = 'adhoc'
+
+    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context=_ssl_ctx)
 
 
 if __name__ == "__main__":

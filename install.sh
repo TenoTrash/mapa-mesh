@@ -12,7 +12,7 @@ source venv/bin/activate
 
 echo "==> Instalando dependencias..."
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements.txt  # incluye pyopenssl para HTTPS
 
 echo ""
 echo "✓ Instalación completa."

@@ -3,6 +3,8 @@
 Mapa local de red Meshtastic con traceroute activo, desarrollado para [MeshArg](https://mesharg.com.ar).
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Version](https://img.shields.io/badge/version-1.1-blue)
+![Version](https://img.shields.io/badge/version-1.1-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Meshtastic](https://img.shields.io/badge/meshtastic-compatible-brightgreen)
 
@@ -161,6 +163,33 @@ mapa-mesh/
 ├── install.sh          # Instalador del entorno virtual
 ├── credits.txt         # Créditos
 └── README.md           # Este archivo
+```
+
+---
+
+## SSL / HTTPS
+
+mapa-mesh soporta HTTPS con certificado real o autofirmado.
+
+**Con certificado real (recomendado):**
+
+Colocá los archivos en la carpeta `ssl/` dentro del proyecto:
+```
+mapa-mesh/
+└── ssl/
+    ├── mapa-mesh_hopto_org.pem   # certificado (PEM Chain)
+    └── mapa-mesh.key             # clave privada generada con openssl
+```
+
+El programa detecta automáticamente los certificados al arrancar. Si no los encuentra, usa un certificado autofirmado como fallback.
+
+**Generar la clave privada y CSR:**
+```bash
+mkdir -p ssl
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout ssl/mapa-mesh.key \
+  -out ssl/mapa-mesh.csr \
+  -subj "/C=AR/ST=Buenos Aires/L=Buenos Aires/O=MeshArg/CN=tu-dominio.hopto.org"
 ```
 
 ---
