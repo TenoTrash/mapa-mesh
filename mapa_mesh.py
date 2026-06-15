@@ -54,6 +54,14 @@ PRUNE_AFTER_SEC = 36 * 60 * 60
 # Intervalo de polling del frontend (segundos)
 POLL_REFRESH_SEC = 3
 
+# Watchdog: cada cuántos segundos verifica que Flask responde
+WATCHDOG_INTERVAL_SEC  = 30
+# Cuántos fallos consecutivos antes de reiniciar
+WATCHDOG_MAX_FAILS     = 3
+# Archivo de backup de estado (mismo directorio que el script)
+import os as _os
+BACKUP_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "state_backup.json")
+
 # =============================================================================
 #                               MODELO DE DATOS
 # =============================================================================
@@ -674,6 +682,11 @@ def meshtastic_thread():
 
 app      = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# Permite reutilizar el puerto inmediatamente después de un reinicio
+import socket as _socket
+app.config["PROPAGATE_EXCEPTIONS"] = True
+_reuse = getattr(_socket, "SO_REUSEPORT", None) or _socket.SO_REUSEADDR
 
 
 def get_status() -> dict:
@@ -1423,10 +1436,188 @@ setInterval(poll, {int(POLL_REFRESH_SEC * 1000)});
 
 
 # =============================================================================
+#                        BACKUP DE ESTADO Y WATCHDOG
+# =============================================================================
+
+def save_state_backup():
+    """
+    Guarda el estado actual de nodos (con rutas) en BACKUP_FILE como JSON.
+    Se llama antes de reiniciar el proceso.
+    """
+    import json as _json
+    try:
+        data = []
+        with nodes_lock:
+            for nid, e in nodes.items():
+                entry = {
+                    "node_id":    e.node_id,
+                    "short_name": e.short_name,
+                    "long_name":  e.long_name,
+                    "lat":        e.lat,
+                    "lon":        e.lon,
+                    "alt":        e.alt,
+                    "role":       e.role,
+                    "rssi":       e.rssi,
+                    "snr":        e.snr,
+                    "hops":       e.hops,
+                    "dist_km":    e.dist_km,
+                    "last_seen":  e.last_seen,
+                    "route":      None,
+                }
+                if e.route:
+                    entry["route"] = {
+                        "hops_forward":   e.route.hops_forward,
+                        "hops_back":      e.route.hops_back,
+                        "hop_count_fwd":  e.route.hop_count_fwd,
+                        "hop_count_back": e.route.hop_count_back,
+                        "timestamp":      e.route.timestamp,
+                    }
+                data.append(entry)
+
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            _json.dump({"saved_at": now(), "nodes": data}, f, ensure_ascii=False, indent=2)
+
+        log.info(f"Backup guardado: {len(data)} nodos → {BACKUP_FILE}")
+    except Exception as e:
+        log.error(f"Error guardando backup: {e}")
+
+
+def load_state_backup():
+    """
+    Carga el backup JSON al arrancar. Restaura nodos y rutas en memoria.
+    Si el archivo no existe o está corrupto, arranca limpio.
+    """
+    import json as _json
+    if not _os.path.exists(BACKUP_FILE):
+        log.info("Sin backup previo, arrancando limpio")
+        return
+
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        saved_at = data.get("saved_at", 0)
+        age_h    = (now() - saved_at) / 3600
+        entries  = data.get("nodes", [])
+
+        # No cargar backups de más de PRUNE_AFTER_SEC
+        if (now() - saved_at) > PRUNE_AFTER_SEC:
+            log.info(f"Backup demasiado viejo ({age_h:.1f}h), ignorando")
+            return
+
+        loaded = 0
+        with nodes_lock:
+            for e in entries:
+                nid   = e.get("node_id", "")
+                if not nid:
+                    continue
+                entry = NodeEntry(node_id=nid)
+                entry.short_name = e.get("short_name") or ""
+                entry.long_name  = e.get("long_name")  or ""
+                entry.lat        = e.get("lat")
+                entry.lon        = e.get("lon")
+                entry.alt        = e.get("alt")
+                entry.role       = e.get("role")       or ""
+                entry.rssi       = e.get("rssi")
+                entry.snr        = e.get("snr")
+                entry.hops       = e.get("hops")
+                entry.dist_km    = e.get("dist_km")
+                entry.last_seen  = e.get("last_seen")  or now()
+
+                r = e.get("route")
+                if r:
+                    entry.route = RouteInfo(
+                        hops_forward   = r.get("hops_forward",  []),
+                        hops_back      = r.get("hops_back",     []),
+                        hop_count_fwd  = r.get("hop_count_fwd",  0),
+                        hop_count_back = r.get("hop_count_back", 0),
+                        timestamp      = r.get("timestamp",      0.0),
+                    )
+                nodes[nid] = entry
+                loaded += 1
+
+        log.info(f"Backup restaurado: {loaded} nodos (guardado hace {age_h:.1f}h)")
+    except Exception as e:
+        log.error(f"Error cargando backup: {e}")
+
+
+def watchdog_thread():
+    """
+    Hilo daemon que cada WATCHDOG_INTERVAL_SEC verifica que Flask responde
+    haciendo un GET a /api/nodes en localhost.
+    Si falla WATCHDOG_MAX_FAILS veces consecutivas:
+      1. Guarda el estado en JSON
+      2. Reinicia el proceso completo via os.execv
+    """
+    import urllib.request
+    import urllib.error
+
+    fails  = 0
+    url    = f"https://127.0.0.1:{BIND_PORT}/api/nodes"
+    ctx    = None
+
+    # Contexto SSL que ignora el certificado autofirmado
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+    except Exception:
+        pass
+
+    # Esperar a que Flask arranque antes del primer chequeo
+    time.sleep(15)
+
+    while True:
+        try:
+            req = urllib.request.urlopen(url, timeout=15, context=ctx)
+            req.read()
+            if fails > 0:
+                log.info(f"Watchdog: Flask respondió OK (fallos previos: {fails})")
+            fails = 0
+        except Exception as e:
+            # SSL handshake timeout puede ocurrir cuando el traceroute worker
+            # está ocupado — no es un fallo real de Flask, solo lentitud.
+            # Solo contamos como fallo si NO es un timeout de handshake SSL.
+            err_str = str(e).lower()
+            if "handshake" in err_str or "timed out" in err_str:
+                log.debug(f"Watchdog: timeout SSL transitorio (ignorado) — {e}")
+                # No incrementamos fails — Flask sigue vivo
+            else:
+                fails += 1
+                log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
+
+            if fails >= WATCHDOG_MAX_FAILS:
+                log.error("Watchdog: reiniciando proceso...")
+                save_state_backup()
+
+                # Cerrar el socket de Flask liberando el puerto antes de execv.
+                # Enviamos SIGTERM al proceso actual para que el SO libere el
+                # puerto, luego execv reemplaza el proceso con uno nuevo.
+                import sys, signal
+                save_pid = _os.getpid()
+                log.info(f"Watchdog: liberando puerto (pid={save_pid})...")
+
+                # Intentar cerrar el socket del servidor si está accesible
+                try:
+                    socketio.stop()
+                except Exception:
+                    pass
+
+                time.sleep(3)  # dar tiempo al SO para liberar el puerto
+                _os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        time.sleep(WATCHDOG_INTERVAL_SEC)
+
+
+# =============================================================================
 #                               MAIN
 # =============================================================================
 
 def main():
+    # Restaurar estado desde backup si existe
+    load_state_backup()
+
     # Hilo de conexión Meshtastic
     t_mesh = threading.Thread(target=meshtastic_thread, daemon=True)
     t_mesh.start()
@@ -1439,7 +1630,11 @@ def main():
     t_hb = threading.Thread(target=nodeinfo_heartbeat_thread, daemon=True, name="nodeinfo-heartbeat")
     t_hb.start()
 
-    log.info(f"Servidor en http://{BIND_HOST}:{BIND_PORT}")
+    # Watchdog: reinicia el proceso si Flask deja de responder
+    t_wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
+    t_wd.start()
+
+    log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context='adhoc')
 
 
