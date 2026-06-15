@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # =============================================================================
-# mapa-mesh — v1.1
+# mapa-mesh — v1.0
 # Muestra nodos Meshtastic con GPS en un mapa local.
 # Realiza traceroute activo cuando llega un paquete de posicion,
 # dibuja ruta de ida (azul) y vuelta (naranja) sobre Leaflet/OSM.
@@ -50,10 +50,9 @@ SERIAL_PORT   = "/dev/ttyACM0"
 BIND_HOST     = "0.0.0.0"
 BIND_PORT     = 8080
 
-# Coordenadas de TU nodo (sin GPS — EDITÁ ESTO antes de usar)
-# Ejemplo: Centro de Buenos Aires. Reemplazá con tu ubicación real.
-HOME_LAT      = -34.603722
-HOME_LON      = -58.381592
+# Coordenadas de TU nodo (sin GPS — editá esto cada vez que cambies de lugar)
+HOME_LAT      = -34.606615
+HOME_LON      = -58.4355
 
 # Centro inicial del mapa y zoom
 MAP_CENTER_LAT  = HOME_LAT
@@ -1637,43 +1636,24 @@ def watchdog_thread():
       1. Guarda el estado en JSON
       2. Reinicia el proceso completo via os.execv
     """
-    import urllib.request
-    import urllib.error
-
-    fails  = 0
-    url    = f"https://127.0.0.1:{BIND_PORT}/api/nodes"
-    ctx    = None
-
-    # Contexto SSL que ignora el certificado autofirmado
-    try:
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-    except Exception:
-        pass
+    fails = 0
 
     # Esperar a que Flask arranque antes del primer chequeo
     time.sleep(15)
 
     while True:
         try:
-            req = urllib.request.urlopen(url, timeout=15, context=ctx)
-            req.read()
+            # Check TCP simple — sin SSL handshake, sin falsos positivos.
+            # Si el puerto acepta la conexión, Flask está vivo.
+            import socket as _wdsock
+            sock = _wdsock.create_connection(("127.0.0.1", BIND_PORT), timeout=5)
+            sock.close()
             if fails > 0:
                 log.info(f"Watchdog: Flask respondió OK (fallos previos: {fails})")
             fails = 0
         except Exception as e:
-            # SSL handshake timeout puede ocurrir cuando el traceroute worker
-            # está ocupado — no es un fallo real de Flask, solo lentitud.
-            # Solo contamos como fallo si NO es un timeout de handshake SSL.
-            err_str = str(e).lower()
-            if "handshake" in err_str or "timed out" in err_str:
-                log.debug(f"Watchdog: timeout SSL transitorio (ignorado) — {e}")
-                # No incrementamos fails — Flask sigue vivo
-            else:
-                fails += 1
-                log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
+            fails += 1
+            log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
 
             if fails >= WATCHDOG_MAX_FAILS:
                 log.error("Watchdog: reiniciando proceso...")
@@ -1724,8 +1704,8 @@ def main():
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     import os as _ssl_os
-    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "cert.pem")
-    _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "cert.key")
+    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh_hopto_org.pem")
+    _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.key")
 
     if _ssl_os.path.exists(_SSL_CERT) and _ssl_os.path.exists(_SSL_KEY):
         log.info(f"Usando certificado SSL: {_SSL_CERT}")
