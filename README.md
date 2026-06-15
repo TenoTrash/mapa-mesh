@@ -177,7 +177,7 @@ Colocá los archivos en la carpeta `ssl/` dentro del proyecto:
 ```
 mapa-mesh/
 └── ssl/
-    ├── mapa-mesh_hopto_org.pem   # certificado (PEM Chain)
+    ├── mapa-mesh.pem   # certificado (PEM Chain)
     └── mapa-mesh.key             # clave privada generada con openssl
 ```
 
@@ -189,7 +189,7 @@ mkdir -p ssl
 openssl req -new -newkey rsa:2048 -nodes \
   -keyout ssl/mapa-mesh.key \
   -out ssl/mapa-mesh.csr \
-  -subj "/C=AR/ST=Buenos Aires/L=Buenos Aires/O=MeshArg/CN=tu-dominio.hopto.org"
+  -subj "/C=AR/ST=Buenos Aires/L=Buenos Aires/O=MeshArg/CN=tu-dominio.org"
 ```
 
 ---
