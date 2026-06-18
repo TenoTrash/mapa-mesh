@@ -1760,7 +1760,7 @@ def main():
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     import os as _ssl_os
-    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh_hopto_org.pem")
+    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.pem")
     _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.key")
 
     if _ssl_os.path.exists(_SSL_CERT) and _ssl_os.path.exists(_SSL_KEY):
