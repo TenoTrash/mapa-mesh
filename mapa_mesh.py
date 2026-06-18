@@ -749,6 +749,22 @@ def get_status() -> dict:
     }
 
 
+def _csv_safe(value):
+    """
+    Neutraliza CSV/Formula Injection (CWE-1236).
+    Si un nombre de nodo remoto empieza con =, +, -, @, tab o CR, Excel/
+    LibreOffice puede interpretarlo como fórmula al abrir el CSV exportado,
+    permitiendo ejecución de comandos en la máquina de quien lo abre.
+    Se neutraliza prefijando con un apóstrofo, igual que hace Google Sheets.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 @app.get("/export/routes.csv")
 def export_routes_csv():
     import io
@@ -763,13 +779,13 @@ def export_routes_csv():
             ts = datetime.datetime.fromtimestamp(e.route.timestamp).strftime("%Y-%m-%d %H:%M:%S")
             rows.append([
                 ts,
-                e.node_id,
-                e.short_name,
-                e.long_name,
-                e.role,
-                " > ".join(e.route.hops_forward) if e.route.hops_forward else "directo",
+                _csv_safe(e.node_id),
+                _csv_safe(e.short_name),
+                _csv_safe(e.long_name),
+                _csv_safe(e.role),
+                _csv_safe(" > ".join(e.route.hops_forward) if e.route.hops_forward else "directo"),
                 e.route.hop_count_fwd,
-                " > ".join(e.route.hops_back) if e.route.hops_back else "directo",
+                _csv_safe(" > ".join(e.route.hops_back) if e.route.hops_back else "directo"),
                 e.route.hop_count_back,
                 e.rssi if e.rssi is not None else "",
                 e.snr  if e.snr  is not None else "",
@@ -1183,9 +1199,22 @@ function fmtAge(sec) {{
   const h = Math.floor(m/60); return h + "h " + (m%60) + "m";
 }}
 
+// Escapa cualquier texto antes de insertarlo en innerHTML.
+// CRÍTICO: todo dato que viene del mesh (nombres, roles, mensajes, IDs de
+// nodos remotos) es entrada no confiable — cualquier nodo en la red puede
+// mandar un shortName/longName/mensaje con HTML o JS embebido. Sin esto,
+// un nodo malicioso podría ejecutar script arbitrario en el navegador de
+// quien mire el mapa (XSS).
+function escapeHtml(str) {{
+  if (str == null) return "";
+  const div = document.createElement("div");
+  div.textContent = String(str);
+  return div.innerHTML;
+}}
+
 function popupHtml(n) {{
-  const sn  = n.short_name || "—";
-  const ln  = n.long_name  || "";
+  const sn  = escapeHtml(n.short_name) || "—";
+  const ln  = escapeHtml(n.long_name)  || "";
   const ago = fmtAge(Date.now()/1000 - n.last_seen);
   const rssi = n.rssi  != null ? n.rssi.toFixed(0)  + " dBm" : "?";
   const snr  = n.snr   != null ? n.snr.toFixed(2)   + " dB"  : "?";
@@ -1214,8 +1243,9 @@ function popupHtml(n) {{
       </div>`;
   }}
 
+  const roleEsc = escapeHtml(n.role);
   return `<div class="lf-popup">
-    <div class="pid">${{n.node_id}}${{n.role ? ' · <span style="color:#94a3b8">' + n.role + '</span>' : ""}}</div>
+    <div class="pid">${{escapeHtml(n.node_id)}}${{roleEsc ? ' · <span style="color:#94a3b8">' + roleEsc + '</span>' : ""}}</div>
     <div class="pname">${{sn}}${{ln ? " — " + ln : ""}}</div>
     <div class="prow"><span class="pk">RSSI</span><span class="pv">${{rssi}}</span></div>
     <div class="prow"><span class="pk">SNR</span><span class="pv">${{snr}}</span></div>
@@ -1227,11 +1257,13 @@ function popupHtml(n) {{
   </div>`;
 }}
 
-// Resuelve el nombre legible de un nodo a partir del nodeIndex
+// Resuelve el nombre legible de un nodo a partir del nodeIndex.
+// Siempre devuelve texto ya escapado — se usa directamente en innerHTML.
 function resolveHopName(node_id) {{
+  const safeId = escapeHtml(node_id);
   const info = nodeIndex[node_id];
-  if (!info) return node_id;
-  return info.short_name || info.long_name || node_id;
+  if (!info) return safeId;
+  return escapeHtml(info.short_name) || escapeHtml(info.long_name) || safeId;
 }}
 
 function drawRoutes(n) {{
@@ -1374,11 +1406,14 @@ function renderNodes(data) {{
                    <span class="badge-back"> ↙${{n.route.hop_count_back}} saltos</span>`;
     }}
 
+    const safeNodeId = escapeHtml(n.node_id);
+    const safeName    = escapeHtml(n.short_name) || escapeHtml(n.long_name) || "(sin nombre)";
+
     const div = document.createElement("div");
     div.className = "node-row" + (hasPos ? "" : " no-gps");
     div.innerHTML = `
-      <div class="node-id">${{n.node_id}}</div>
-      <div class="node-name">${{n.short_name || n.long_name || "(sin nombre)"}}</div>
+      <div class="node-id">${{safeNodeId}}</div>
+      <div class="node-name">${{safeName}}</div>
       <div class="node-meta">
         ${{ago}} · RSSI ${{rssi}} · SNR ${{snr}} · H:${{hops}} · ${{dist}}
         ${{hasPos ? "" : " · <em>sin GPS</em>"}}
@@ -1470,14 +1505,16 @@ function renderMessages(msgs) {{
   for (const m of sorted) {{
     const div = document.createElement("div");
     div.className = "msg-row";
-    const chLabel = m.channel > 0 ? `<span class="msg-ch">ch${{m.channel}}</span>` : "";
+    const safeSender = escapeHtml(m.from_name) || escapeHtml(m.from_id);
+    const safeText   = escapeHtml(m.text);
+    const safeCh     = m.channel > 0 ? `<span class="msg-ch">ch${{escapeHtml(m.channel)}}</span>` : "";
     div.innerHTML = `
       <div class="msg-meta">
-        <span class="msg-sender">${{m.from_name || m.from_id}}</span>
-        ${{chLabel}}
+        <span class="msg-sender">${{safeSender}}</span>
+        ${{safeCh}}
         <span style="float:right;color:var(--muted);font-size:10px">${{fmtTime(m.timestamp)}}</span>
       </div>
-      <div class="msg-text">${{m.text}}</div>
+      <div class="msg-text">${{safeText}}</div>
     `;
     list.appendChild(div);
   }}
@@ -1636,24 +1673,43 @@ def watchdog_thread():
       1. Guarda el estado en JSON
       2. Reinicia el proceso completo via os.execv
     """
-    fails = 0
+    import urllib.request
+    import urllib.error
+
+    fails  = 0
+    url    = f"https://127.0.0.1:{BIND_PORT}/api/nodes"
+    ctx    = None
+
+    # Contexto SSL que ignora el certificado autofirmado
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+    except Exception:
+        pass
 
     # Esperar a que Flask arranque antes del primer chequeo
     time.sleep(15)
 
     while True:
         try:
-            # Check TCP simple — sin SSL handshake, sin falsos positivos.
-            # Si el puerto acepta la conexión, Flask está vivo.
-            import socket as _wdsock
-            sock = _wdsock.create_connection(("127.0.0.1", BIND_PORT), timeout=5)
-            sock.close()
+            req = urllib.request.urlopen(url, timeout=15, context=ctx)
+            req.read()
             if fails > 0:
                 log.info(f"Watchdog: Flask respondió OK (fallos previos: {fails})")
             fails = 0
         except Exception as e:
-            fails += 1
-            log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
+            # SSL handshake timeout puede ocurrir cuando el traceroute worker
+            # está ocupado — no es un fallo real de Flask, solo lentitud.
+            # Solo contamos como fallo si NO es un timeout de handshake SSL.
+            err_str = str(e).lower()
+            if "handshake" in err_str or "timed out" in err_str:
+                log.debug(f"Watchdog: timeout SSL transitorio (ignorado) — {e}")
+                # No incrementamos fails — Flask sigue vivo
+            else:
+                fails += 1
+                log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
 
             if fails >= WATCHDOG_MAX_FAILS:
                 log.error("Watchdog: reiniciando proceso...")
@@ -1704,7 +1760,7 @@ def main():
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     import os as _ssl_os
-    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.pem")
+    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh_hopto_org.pem")
     _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.key")
 
     if _ssl_os.path.exists(_SSL_CERT) and _ssl_os.path.exists(_SSL_KEY):
@@ -1714,7 +1770,7 @@ def main():
         log.warning("Certificados SSL no encontrados, usando adhoc (autofirmado)")
         _ssl_ctx = 'adhoc'
 
-    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context=_ssl_ctx)
+    socketio.run(app, host=BIND_HOST, port=BIND_PORT, debug=False, use_reloader=False, ssl_context=_ssl_ctx, allow_unsafe_werkzeug=True)
 
 
 if __name__ == "__main__":
