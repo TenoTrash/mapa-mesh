@@ -60,7 +60,7 @@ MAP_CENTER_LON  = HOME_LON
 MAP_CENTER_ZOOM = 12
 
 # Tiempo mínimo entre traceroutes al mismo nodo (segundos)
-TRACEROUTE_COOLDOWN_SEC = 60
+TRACEROUTE_COOLDOWN_SEC = 60 * 60 #cada 5 minutos
 
 # Timeout para esperar respuesta de traceroute (segundos)
 TRACEROUTE_TIMEOUT_SEC  = 15
@@ -69,7 +69,10 @@ TRACEROUTE_TIMEOUT_SEC  = 15
 PRUNE_AFTER_SEC = 36 * 60 * 60
 
 # Intervalo de polling del frontend (segundos)
-POLL_REFRESH_SEC = 3
+POLL_REFRESH_SEC = 10
+
+# Intervalo del ciclo periódico de traceroute a todos los nodos con GPS (segundos)
+TRACEROUTE_PERIODIC_SEC = 5 * 60   # cada 5 minutos
 
 # Watchdog: cada cuántos segundos verifica que Flask responde
 WATCHDOG_INTERVAL_SEC  = 30
@@ -181,10 +184,17 @@ def normalize_coord(x):
         return None
     if isinstance(x, int):
         if abs(x) > 10_000_000:
-            return x / 1e7
-        if abs(x) > 1_000_000:
-            return x / 1e6
-    return float(x)
+            x = x / 1e7
+        elif abs(x) > 1_000_000:
+            x = x / 1e6
+        else:
+            x = float(x)
+    else:
+        x = float(x)
+    # Descartar null island (0,0) — coordenadas inválidas típicas de GPS sin fix
+    if abs(x) < 0.001:
+        return None
+    return x
 
 
 def update_node(node_id: str, **kwargs):
@@ -466,6 +476,49 @@ def nodeinfo_heartbeat_thread():
     while True:
         time.sleep(NODEINFO_INTERVAL_SEC)
         send_nodeinfo_heartbeat()
+
+
+# =============================================================================
+#                  TRACEROUTE PERIÓDICO — ciclo cada 5 minutos
+# =============================================================================
+#
+# Además de traceroutear cuando llega un paquete de posición, este hilo
+# revisa periódicamente todos los nodos con GPS conocidos y los reencola
+# si ya pasó el cooldown individual. Así las rutas se mantienen actualizadas
+# aunque los nodos dejen de mandar posición frecuentemente.
+#
+# El cooldown por nodo (TRACEROUTE_COOLDOWN_SEC) evita que se saturen nodos
+# que sí mandan posición seguido. La cola serializada garantiza que nunca
+# hay dos traceroutes en vuelo simultáneos.
+#
+# =============================================================================
+
+def periodic_traceroute_thread():
+    """
+    Hilo daemon que cada TRACEROUTE_PERIODIC_SEC encola traceroutes
+    para todos los nodos con GPS conocidos que hayan superado el cooldown.
+    """
+    # Esperar a que el nodo esté conectado y haya algo de datos antes del primer ciclo
+    time.sleep(TRACEROUTE_PERIODIC_SEC)
+
+    while True:
+        with nodes_lock:
+            nodos_con_gps = [
+                nid for nid, e in nodes.items()
+                if e.lat is not None and e.lon is not None
+            ]
+
+        log.info(f"Ciclo periódico de traceroute: {len(nodos_con_gps)} nodos con GPS")
+
+        encolados = 0
+        for nid in nodos_con_gps:
+            maybe_schedule_traceroute(nid)
+            encolados += 1
+
+        if encolados > 0:
+            log.info(f"Ciclo periódico: {encolados} nodos evaluados para traceroute")
+
+        time.sleep(TRACEROUTE_PERIODIC_SEC)
 
 
 # =============================================================================
@@ -1754,13 +1807,17 @@ def main():
     t_hb = threading.Thread(target=nodeinfo_heartbeat_thread, daemon=True, name="nodeinfo-heartbeat")
     t_hb.start()
 
+    # Traceroute periódico: re-traza todos los nodos con GPS cada 5 minutos
+    t_ptr = threading.Thread(target=periodic_traceroute_thread, daemon=True, name="traceroute-periodic")
+    t_ptr.start()
+
     # Watchdog: reinicia el proceso si Flask deja de responder
     t_wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
     t_wd.start()
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     import os as _ssl_os
-    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.pem")
+    _SSL_CERT = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh_hopto_org.pem")
     _SSL_KEY  = _ssl_os.path.join(_ssl_os.path.dirname(_ssl_os.path.abspath(__file__)), "ssl", "mapa-mesh.key")
 
     if _ssl_os.path.exists(_SSL_CERT) and _ssl_os.path.exists(_SSL_KEY):
