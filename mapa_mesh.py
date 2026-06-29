@@ -58,7 +58,7 @@ HOME_LON      = -58.4355
 # Centro inicial del mapa y zoom
 MAP_CENTER_LAT  = HOME_LAT
 MAP_CENTER_LON  = HOME_LON
-MAP_CENTER_ZOOM = 12
+MAP_CENTER_ZOOM = 11
 
 # Tiempo mínimo entre traceroutes al mismo nodo (segundos)
 TRACEROUTE_COOLDOWN_SEC = 5 * 60 #cada 5 minutos
