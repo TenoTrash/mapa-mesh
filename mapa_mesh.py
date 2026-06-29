@@ -22,6 +22,7 @@ from flask_socketio import SocketIO
 from pubsub import pub
 
 import meshtastic.serial_interface
+from meshtastic.protobuf import mesh_pb2, portnums_pb2
 
 import os as _os_log
 _LOG_FILE = _os_log.path.join(_os_log.path.dirname(_os_log.path.abspath(__file__)), "mapa_mesh.log")
@@ -60,7 +61,7 @@ MAP_CENTER_LON  = HOME_LON
 MAP_CENTER_ZOOM = 12
 
 # Tiempo mínimo entre traceroutes al mismo nodo (segundos)
-TRACEROUTE_COOLDOWN_SEC = 60 * 60 #cada 5 minutos
+TRACEROUTE_COOLDOWN_SEC = 5 * 60 #cada 5 minutos
 
 # Timeout para esperar respuesta de traceroute (segundos)
 TRACEROUTE_TIMEOUT_SEC  = 15
@@ -74,10 +75,6 @@ POLL_REFRESH_SEC = 10
 # Intervalo del ciclo periódico de traceroute a todos los nodos con GPS (segundos)
 TRACEROUTE_PERIODIC_SEC = 5 * 60   # cada 5 minutos
 
-# Watchdog: cada cuántos segundos verifica que Flask responde
-WATCHDOG_INTERVAL_SEC  = 30
-# Cuántos fallos consecutivos antes de reiniciar
-WATCHDOG_MAX_FAILS     = 3
 # Archivo de backup de estado (mismo directorio que el script)
 import os as _os
 BACKUP_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "state_backup.json")
@@ -335,39 +332,37 @@ def traceroute_worker():
 
         log.info(f"Traceroute → {node_id}")
 
-        # sendTraceRoute() bloquea hasta respuesta o timeout.
-        # Timeout duro de 20s: si el SDK no retorna, el worker continúa.
+        # Usamos sendData() directamente en lugar de sendTraceRoute().
         #
-        # ORDEN CORRECTO del timestamp:
-        #   1. Lanzar _send() en hilo separado
-        #   2. Esperar hasta que termina O hasta 20s
-        #   3. Recién AHÍ registrar last_traceroute_sent_ts
-        #   4. Calcular cooldown restante desde ese timestamp
+        # sendTraceRoute() internamente hace:
+        #   1. sendData(... TRACEROUTE_APP ...)   ← lo que queremos
+        #   2. waitForTraceRoute(waitFactor)       ← NO lo queremos
         #
-        # Así nunca arranca el siguiente traceroute antes de que el firmware
-        # haya salido del cooldown de 30s, incluso si _send() quedó bloqueado.
-        SEND_TIMEOUT_SEC = 20
-        send_done = threading.Event()
+        # El waitFactor = min(len(nodes)-1, hopLimit) = min(144, 7) = 7
+        # expireTimeout = 20s * 7 = 140s de bloqueo por traceroute fallido.
+        #
+        # La respuesta del traceroute llega por pubsub (on_receive TRACEROUTE_APP)
+        # de forma completamente asíncrona — waitForTraceRoute() es redundante
+        # para nuestro uso y solo causa bloqueo y fuga de hilos.
+        #
+        # Usando sendData() directamente el worker retorna INMEDIATAMENTE
+        # después de enviar el paquete, sin esperar respuesta. La respuesta
+        # llega cuando llega, por on_receive.
+        try:
+            r = mesh_pb2.RouteDiscovery()
+            iface.sendData(
+                r,
+                destinationId=node_id,
+                portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                wantResponse=True,
+                hopLimit=7,
+            )
+        except Exception as e:
+            log.warning(f"sendData traceroute excepcion para {node_id}: {e}")
 
-        def _send():
-            try:
-                iface.sendTraceRoute(dest=node_id, hopLimit=7)
-            except Exception as e:
-                log.warning(f"sendTraceRoute excepcion para {node_id}: {e}")
-            finally:
-                send_done.set()
-
-        send_thread = threading.Thread(target=_send, daemon=True)
-        send_thread.start()
-        completed = send_done.wait(timeout=SEND_TIMEOUT_SEC)
-
-        # Registrar timestamp DESPUÉS de que el envío terminó (o de que expiró)
-        # El cooldown del próximo traceroute se cuenta desde este momento.
+        # Registrar timestamp después del envío (retorna inmediatamente)
         with traceroute_global_lock:
             last_traceroute_sent_ts = now()
-
-        if not completed:
-            log.warning(f"Traceroute timeout duro ({SEND_TIMEOUT_SEC}s) para {node_id} — continuando cola")
 
         with nodes_lock:
             if node_id in nodes:
@@ -836,6 +831,8 @@ def export_routes_csv():
                 _csv_safe(e.short_name),
                 _csv_safe(e.long_name),
                 _csv_safe(e.role),
+                round(e.lat, 7) if e.lat is not None else "",
+                round(e.lon, 7) if e.lon is not None else "",
                 _csv_safe(" > ".join(e.route.hops_forward) if e.route.hops_forward else "directo"),
                 e.route.hop_count_fwd,
                 _csv_safe(" > ".join(e.route.hops_back) if e.route.hops_back else "directo"),
@@ -849,6 +846,7 @@ def export_routes_csv():
     writer = csv.writer(output)
     writer.writerow([
         "timestamp", "node_id", "short_name", "long_name", "role",
+        "lat", "lon",
         "hops_forward", "hop_count_fwd",
         "hops_back", "hop_count_back",
         "rssi", "snr", "dist_km"
@@ -857,6 +855,52 @@ def export_routes_csv():
 
     resp = Response(output.getvalue(), mimetype="text/csv; charset=utf-8")
     resp.headers["Content-Disposition"] = 'attachment; filename="rutas_mesh.csv"'
+    return resp
+
+
+@app.get("/export/nodes.csv")
+def export_nodes_csv():
+    """
+    Exporta todos los nodos conocidos (con o sin ruta) como CSV.
+    Incluye lat/lon para permitir cálculo externo de convex hull y cobertura.
+    Solo exporta nodos con GPS válido (lat y lon no nulos).
+    """
+    import io
+    import csv
+    import datetime
+
+    rows = []
+    with nodes_lock:
+        for nid, e in nodes.items():
+            if e.lat is None or e.lon is None:
+                continue
+            last_seen_str = datetime.datetime.fromtimestamp(e.last_seen).strftime("%Y-%m-%d %H:%M:%S")
+            rows.append([
+                last_seen_str,
+                _csv_safe(e.node_id),
+                _csv_safe(e.short_name),
+                _csv_safe(e.long_name),
+                _csv_safe(e.role),
+                round(e.lat, 7),
+                round(e.lon, 7),
+                round(e.alt, 1) if e.alt is not None else "",
+                e.rssi if e.rssi is not None else "",
+                e.snr  if e.snr  is not None else "",
+                e.hops if e.hops is not None else "",
+                round(e.dist_km, 2) if e.dist_km is not None else "",
+            ])
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "last_seen", "node_id", "short_name", "long_name", "role",
+        "lat", "lon", "alt_m",
+        "rssi", "snr", "hops", "dist_km",
+    ])
+    writer.writerows(rows)
+
+    resp = Response(output.getvalue(), mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = 'attachment; filename="nodos_mesh.csv"'
     return resp
 
 
@@ -875,7 +919,6 @@ def serve_logo():
 def api_nodes():
     from flask import request as flask_req
     client_ip = flask_req.remote_addr or "unknown"
-    # Excluir el watchdog (127.0.0.1) del conteo de viewers
     if client_ip != "127.0.0.1":
         with active_connections_lock:
             active_connections[client_ip] = now()
@@ -1143,21 +1186,31 @@ def index():
       </div>
       <div class="stat-box">
         <div class="stat-num" id="st-msgs24h">0</div>
-        <div class="stat-lbl">msgs 24h</div>
+        <div class="stat-lbl">msgs 6hs</div>
       </div>
     </div>
 
     <div class="legend">
       <div class="leg-item"><div class="leg-line fwd"></div> ida</div>
       <div class="leg-item"><div class="leg-line back"></div> vuelta</div>
-      <a href="/export/routes.csv" download
-         style="margin-left:auto;font-size:11px;color:var(--muted);text-decoration:none;
-                border:1px solid var(--border);border-radius:4px;padding:2px 8px;
-                white-space:nowrap;transition:color .15s,border-color .15s"
-         onmouseover="this.style.color='var(--text)';this.style.borderColor='var(--text)'"
-         onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">
-        ↓ CSV
-      </a>
+      <div style="margin-left:auto;display:flex;gap:5px;flex-shrink:0">
+        <a href="/export/routes.csv" download title="Exportar rutas (traceroutes)"
+           style="font-size:11px;color:var(--muted);text-decoration:none;
+                  border:1px solid var(--border);border-radius:4px;padding:2px 8px;
+                  white-space:nowrap;transition:color .15s,border-color .15s"
+           onmouseover="this.style.color='var(--text)';this.style.borderColor='var(--text)'"
+           onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">
+          ↓ rutas
+        </a>
+        <a href="/export/nodes.csv" download title="Exportar nodos con GPS"
+           style="font-size:11px;color:var(--muted);text-decoration:none;
+                  border:1px solid var(--border);border-radius:4px;padding:2px 8px;
+                  white-space:nowrap;transition:color .15s,border-color .15s"
+           onmouseover="this.style.color='var(--text)';this.style.borderColor='var(--text)'"
+           onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">
+          ↓ nodos
+        </a>
+      </div>
     </div>
 
     <div class="list-label">Nodos escuchados</div>
@@ -1613,13 +1666,24 @@ setInterval(poll, {int(POLL_REFRESH_SEC * 1000)});
 
 
 # =============================================================================
-#                        BACKUP DE ESTADO Y WATCHDOG
+#                        BACKUP DE ESTADO PERIÓDICO
 # =============================================================================
+#
+# El reinicio del proceso lo maneja systemd (Restart=always en el .service).
+# El watchdog interno fue eliminado porque causaba doble instancia al
+# interactuar con el reinicio automático de systemd a medianoche.
+#
+# En su lugar, el backup se guarda periódicamente cada 15 minutos para
+# que al reiniciar (por systemd o manual) se restaure el estado reciente.
+#
+# =============================================================================
+
+BACKUP_INTERVAL_SEC = 15 * 60  # guardar estado cada 15 minutos
+
 
 def save_state_backup():
     """
     Guarda el estado actual de nodos (con rutas) en BACKUP_FILE como JSON.
-    Se llama antes de reiniciar el proceso.
     """
     import json as _json
     try:
@@ -1677,7 +1741,6 @@ def load_state_backup():
         age_h    = (now() - saved_at) / 3600
         entries  = data.get("nodes", [])
 
-        # No cargar backups de más de PRUNE_AFTER_SEC
         if (now() - saved_at) > PRUNE_AFTER_SEC:
             log.info(f"Backup demasiado viejo ({age_h:.1f}h), ignorando")
             return
@@ -1685,7 +1748,7 @@ def load_state_backup():
         loaded = 0
         with nodes_lock:
             for e in entries:
-                nid   = e.get("node_id", "")
+                nid = e.get("node_id", "")
                 if not nid:
                     continue
                 entry = NodeEntry(node_id=nid)
@@ -1718,73 +1781,14 @@ def load_state_backup():
         log.error(f"Error cargando backup: {e}")
 
 
-def watchdog_thread():
+def backup_thread():
     """
-    Hilo daemon que cada WATCHDOG_INTERVAL_SEC verifica que Flask responde
-    haciendo un GET a /api/nodes en localhost.
-    Si falla WATCHDOG_MAX_FAILS veces consecutivas:
-      1. Guarda el estado en JSON
-      2. Reinicia el proceso completo via os.execv
+    Guarda el estado periódicamente cada BACKUP_INTERVAL_SEC.
+    Reemplaza al watchdog interno — systemd maneja los reinicios.
     """
-    import urllib.request
-    import urllib.error
-
-    fails  = 0
-    url    = f"https://127.0.0.1:{BIND_PORT}/api/nodes"
-    ctx    = None
-
-    # Contexto SSL que ignora el certificado autofirmado
-    try:
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-    except Exception:
-        pass
-
-    # Esperar a que Flask arranque antes del primer chequeo
-    time.sleep(15)
-
     while True:
-        try:
-            req = urllib.request.urlopen(url, timeout=15, context=ctx)
-            req.read()
-            if fails > 0:
-                log.info(f"Watchdog: Flask respondió OK (fallos previos: {fails})")
-            fails = 0
-        except Exception as e:
-            # SSL handshake timeout puede ocurrir cuando el traceroute worker
-            # está ocupado — no es un fallo real de Flask, solo lentitud.
-            # Solo contamos como fallo si NO es un timeout de handshake SSL.
-            err_str = str(e).lower()
-            if "handshake" in err_str or "timed out" in err_str:
-                log.debug(f"Watchdog: timeout SSL transitorio (ignorado) — {e}")
-                # No incrementamos fails — Flask sigue vivo
-            else:
-                fails += 1
-                log.warning(f"Watchdog: Flask no responde ({fails}/{WATCHDOG_MAX_FAILS}) — {e}")
-
-            if fails >= WATCHDOG_MAX_FAILS:
-                log.error("Watchdog: reiniciando proceso...")
-                save_state_backup()
-
-                # Cerrar el socket de Flask liberando el puerto antes de execv.
-                # Enviamos SIGTERM al proceso actual para que el SO libere el
-                # puerto, luego execv reemplaza el proceso con uno nuevo.
-                import sys, signal
-                save_pid = _os.getpid()
-                log.info(f"Watchdog: liberando puerto (pid={save_pid})...")
-
-                # Intentar cerrar el socket del servidor si está accesible
-                try:
-                    socketio.stop()
-                except Exception:
-                    pass
-
-                time.sleep(3)  # dar tiempo al SO para liberar el puerto
-                _os.execv(sys.executable, [sys.executable] + sys.argv)
-
-        time.sleep(WATCHDOG_INTERVAL_SEC)
+        time.sleep(BACKUP_INTERVAL_SEC)
+        save_state_backup()
 
 
 # =============================================================================
@@ -1811,9 +1815,9 @@ def main():
     t_ptr = threading.Thread(target=periodic_traceroute_thread, daemon=True, name="traceroute-periodic")
     t_ptr.start()
 
-    # Watchdog: reinicia el proceso si Flask deja de responder
-    t_wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
-    t_wd.start()
+    # Backup periódico cada 15 minutos (systemd maneja los reinicios)
+    t_bk = threading.Thread(target=backup_thread, daemon=True, name="backup")
+    t_bk.start()
 
     log.info(f"Servidor en https://{BIND_HOST}:{BIND_PORT}")
     import os as _ssl_os
