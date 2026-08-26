@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # =============================================================================
-# mapa-mesh — v1.0
+# mapa-mesh — v1.1
 # Muestra nodos Meshtastic con GPS en un mapa local.
 # Realiza traceroute activo cuando llega un paquete de posicion,
 # dibuja ruta de ida (azul) y vuelta (naranja) sobre Leaflet/OSM.
@@ -47,7 +47,7 @@ log.info(f"Log guardado en: {_LOG_FILE}")
 #                               CONFIGURACION
 # =============================================================================
 
-SERIAL_PORT   = "/dev/ttyACM0"
+SERIAL_PORT   = "/dev/ttyUSB0"
 BIND_HOST     = "0.0.0.0"
 BIND_PORT     = 8080
 
@@ -148,8 +148,10 @@ iface_ref: Optional[meshtastic.serial_interface.SerialInterface] = None
 # ── Cola serializada de traceroutes ─────────────────────────────────────────
 # Un único worker consume esta cola de a un nodo por vez.
 # Esto garantiza: sin paralelismo, sin colisiones de respuesta.
-import queue as _queue
-traceroute_queue: _queue.Queue = _queue.Queue()
+# La cola es una cola de prioridad por distancia (ver DistancePriorityQueue
+# más abajo): se procesan primero los nodos más cercanos y se va "expandiendo"
+# hacia los más lejanos, en vez de simple orden de llegada (FIFO).
+traceroute_queue: "DistancePriorityQueue"  # se instancia después de definir la clase
 
 # Timestamp del último traceroute enviado (global, no por nodo)
 last_traceroute_sent_ts: float = 0.0
@@ -277,12 +279,95 @@ def serialize_messages() -> list:
 #     y pasó TRACEROUTE_COOLDOWN_SEC desde su último traceroute individual.
 #   - La cola descarta duplicados: si un nodo ya está encolado, no se vuelve
 #     a encolar aunque lleguen más paquetes suyos.
+#   - La cola prioriza por distancia (dist_km al nodo home): los nodos más
+#     cercanos se traceroutean primero y la "frontera" de traceroutes se va
+#     expandiendo hacia nodos más lejanos. Esto tiene sentido porque los
+#     nodos cercanos suelen tener mejor enlace y responden más rápido/
+#     confiablemente, y porque sus rutas frecuentemente son prerequisito
+#     (hops intermedios) para resolver las rutas de nodos lejanos.
+#   - Cada TRACEROUTE_QUEUE_REORG_SEC (15 min) se recalculan las prioridades
+#     de todo lo que sigue en cola y se reconstruye el heap, para reflejar
+#     posiciones actualizadas o nodos nuevos que se colaron con más prioridad.
 #
 # =============================================================================
 
-# Set para rastrear qué nodos están actualmente en la cola (evita duplicados)
-_queued_nodes: set = set()
-_queued_lock  = threading.Lock()
+import heapq
+import itertools
+
+
+class DistancePriorityQueue:
+    """
+    Cola de prioridad thread-safe para traceroutes, ordenada por distancia
+    (menor distancia = mayor prioridad = se procesa antes). Nodos sin
+    distancia conocida van al final (prioridad infinita).
+
+    Es "reorganizable": reorganize() recalcula la prioridad de cada nodo
+    que sigue en cola (sin tocar los que ya se sacaron) y reconstruye el
+    heap, para que la cola refleje distancias actualizadas con el tiempo.
+    """
+
+    def __init__(self):
+        self._heap: List[Tuple[float, int, str]] = []   # (priority, seq, node_id)
+        self._members: set = set()                       # node_ids en cola (evita duplicados)
+        self._counter = itertools.count()                 # desempate estable entre iguales
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+
+    def put(self, node_id: str, priority: float) -> bool:
+        """Encola node_id. Devuelve False si ya estaba en la cola (no-op)."""
+        with self._not_empty:
+            if node_id in self._members:
+                return False
+            self._members.add(node_id)
+            heapq.heappush(self._heap, (priority, next(self._counter), node_id))
+            self._not_empty.notify()
+            return True
+
+    def get(self) -> str:
+        """Bloquea hasta que haya un nodo disponible y devuelve el de mayor prioridad."""
+        with self._not_empty:
+            while not self._heap:
+                self._not_empty.wait()
+            _priority, _seq, node_id = heapq.heappop(self._heap)
+            self._members.discard(node_id)
+            return node_id
+
+    def contains(self, node_id: str) -> bool:
+        with self._lock:
+            return node_id in self._members
+
+    def qsize(self) -> int:
+        with self._lock:
+            return len(self._heap)
+
+    def reorganize(self, priority_func):
+        """
+        Recalcula la prioridad de cada nodo actualmente en cola (llamando a
+        priority_func(node_id) -> float) y reconstruye el heap desde cero.
+        No afecta al nodo que el worker ya sacó de la cola y está procesando.
+        """
+        with self._not_empty:
+            if not self._heap:
+                return
+            rebuilt = [
+                (priority_func(node_id), next(self._counter), node_id)
+                for (_old_priority, _old_seq, node_id) in self._heap
+            ]
+            heapq.heapify(rebuilt)
+            self._heap = rebuilt
+            self._not_empty.notify_all()
+
+
+traceroute_queue = DistancePriorityQueue()
+
+
+def _node_priority(node_id: str) -> float:
+    """Prioridad de traceroute de un nodo: su dist_km actual (o infinito si se desconoce)."""
+    with nodes_lock:
+        entry = nodes.get(node_id)
+        if entry and entry.dist_km is not None:
+            return entry.dist_km
+    return float("inf")
 
 
 def traceroute_worker():
@@ -293,11 +378,8 @@ def traceroute_worker():
     global last_traceroute_sent_ts
 
     while True:
-        # Bloquea hasta que haya un nodo en la cola
+        # Bloquea hasta que haya un nodo en la cola (el de mayor prioridad, i.e. más cercano)
         node_id = traceroute_queue.get()
-
-        with _queued_lock:
-            _queued_nodes.discard(node_id)
 
         # Verificar que el nodo sigue existiendo y tiene GPS
         with nodes_lock:
@@ -307,7 +389,6 @@ def traceroute_worker():
                 with nodes_lock:
                     if node_id in nodes:
                         nodes[node_id].traceroute_pending = False
-                traceroute_queue.task_done()
                 continue
 
         # Respetar cooldown global del firmware entre envíos consecutivos
@@ -327,7 +408,6 @@ def traceroute_worker():
             with nodes_lock:
                 if node_id in nodes:
                     nodes[node_id].traceroute_pending = False
-            traceroute_queue.task_done()
             continue
 
         log.info(f"Traceroute → {node_id}")
@@ -372,8 +452,6 @@ def traceroute_worker():
         # Empujar actualización al frontend
         socketio.emit("nodes_update", {"nodes": serialize_nodes(), "status": get_status()})
 
-        traceroute_queue.task_done()
-
 
 def maybe_schedule_traceroute(node_id: str):
     """
@@ -381,6 +459,8 @@ def maybe_schedule_traceroute(node_id: str):
       - Tiene GPS
       - No está ya encolado o en ejecución (traceroute_pending)
       - Pasó TRACEROUTE_COOLDOWN_SEC desde su último traceroute individual
+    La prioridad en la cola es su distancia actual (dist_km) al nodo home:
+    a menor distancia, antes se procesa.
     """
     with nodes_lock:
         entry = nodes.get(node_id)
@@ -390,6 +470,7 @@ def maybe_schedule_traceroute(node_id: str):
         pending     = entry.traceroute_pending
         elapsed     = now() - entry.last_traceroute_ts
         cooldown_ok = elapsed >= TRACEROUTE_COOLDOWN_SEC
+        dist_km     = entry.dist_km
 
     if not has_pos:
         return
@@ -400,20 +481,20 @@ def maybe_schedule_traceroute(node_id: str):
         log.debug(f"Cooldown activo para {node_id} ({elapsed:.0f}s < {TRACEROUTE_COOLDOWN_SEC}s)")
         return
 
-    # Evitar duplicados en la cola
-    with _queued_lock:
-        if node_id in _queued_nodes:
-            log.debug(f"Nodo {node_id} ya en cola, ignorando")
-            return
-        _queued_nodes.add(node_id)
+    priority = dist_km if dist_km is not None else float("inf")
 
-    # Marcar como pendiente y encolar
+    # put() es atómico: si el nodo ya estaba en cola, no hace nada y devuelve False
+    if not traceroute_queue.put(node_id, priority):
+        log.debug(f"Nodo {node_id} ya en cola, ignorando")
+        return
+
+    # Marcar como pendiente
     with nodes_lock:
         if node_id in nodes:
             nodes[node_id].traceroute_pending = True
 
-    log.info(f"Encolando traceroute para {node_id} (cola: {traceroute_queue.qsize() + 1})")
-    traceroute_queue.put(node_id)
+    dist_str = f"{priority:.1f} km" if priority != float("inf") else "desconocida"
+    log.info(f"Encolando traceroute para {node_id} (dist={dist_str}, cola: {traceroute_queue.qsize()})")
 
 
 # =============================================================================
@@ -514,6 +595,36 @@ def periodic_traceroute_thread():
             log.info(f"Ciclo periódico: {encolados} nodos evaluados para traceroute")
 
         time.sleep(TRACEROUTE_PERIODIC_SEC)
+
+
+# =============================================================================
+#         REORGANIZACIÓN PERIÓDICA DE LA COLA — ciclo cada 15 minutos
+# =============================================================================
+#
+# La cola de traceroutes prioriza por distancia (dist_km) al momento en que
+# cada nodo fue encolado. Con el tiempo esa distancia puede quedar desactua-
+# lizada (el nodo se movió, o se le resolvió el GPS después de encolarse sin
+# posición). Este hilo recalcula periódicamente la prioridad de todo lo que
+# sigue esperando en la cola y reconstruye el heap, para que la cola siga
+# reflejando "cercanos primero, expandiendo hacia los lejanos" con datos
+# frescos.
+#
+# =============================================================================
+
+TRACEROUTE_QUEUE_REORG_SEC = 15 * 60  # cada 15 minutos
+
+
+def traceroute_queue_reorg_thread():
+    """Hilo daemon que reorganiza la cola de traceroutes por distancia cada TRACEROUTE_QUEUE_REORG_SEC."""
+    while True:
+        time.sleep(TRACEROUTE_QUEUE_REORG_SEC)
+
+        size = traceroute_queue.qsize()
+        if size == 0:
+            continue
+
+        traceroute_queue.reorganize(_node_priority)
+        log.info(f"Cola de traceroute reorganizada por distancia ({size} nodos en espera)")
 
 
 # =============================================================================
@@ -939,6 +1050,7 @@ def index():
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>mapa-mesh</title>
+  <link rel="me" href="https://mas.to/@teno"/>
   <link rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
@@ -1814,6 +1926,10 @@ def main():
     # Traceroute periódico: re-traza todos los nodos con GPS cada 5 minutos
     t_ptr = threading.Thread(target=periodic_traceroute_thread, daemon=True, name="traceroute-periodic")
     t_ptr.start()
+
+    # Reorganización de la cola de traceroutes por distancia cada 15 minutos
+    t_reorg = threading.Thread(target=traceroute_queue_reorg_thread, daemon=True, name="traceroute-queue-reorg")
+    t_reorg.start()
 
     # Backup periódico cada 15 minutos (systemd maneja los reinicios)
     t_bk = threading.Thread(target=backup_thread, daemon=True, name="backup")
